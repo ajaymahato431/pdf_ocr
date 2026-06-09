@@ -53,38 +53,26 @@ client = OpenAI(
 # ─── Prompt ───────────────────────────────────────────────────────────────────
 
 OCR_PROMPT = (
-    "You are an expert, highly precise Nepali OCR engine. Your task is to extract all text "
-    "from this document page exactly as it appears in the Devanagari script. "
-    "The extracted text will be used for a RAG (Retrieval-Augmented Generation) system.\n\n"
-    "CRITICAL DIRECTIONS:\n"
-    "1. Do NOT translate the text into English.\n"
-    "2. Keep the output strictly in Nepali (Devanagari script).\n"
-    "3. Output ONLY the extracted text. No introductory text, no conversational filler.\n"
-    "4. Do NOT hallucinate or guess text. Only output what is visibly present on the page.\n"
-    "5. Do NOT add any page numbers, page headers, or page separators.\n\n"
-    "PARAGRAPH REFLOW (VERY IMPORTANT):\n"
-    "6. The PDF has narrow columns, so text lines wrap mid-sentence. You MUST reflow "
-    "text within the same paragraph into one continuous line. Do NOT reproduce the "
-    "visual line breaks from the PDF layout.\n"
-    "7. Use a DOUBLE newline (blank line) ONLY at real logical paragraph/section boundaries, such as:\n"
-    "   - A new दफा (section) number, e.g. '(२) दफा ३ पछि...', '३क.'\n"
-    "   - A new quoted legal clause, e.g. '\"(च१)...सम्झनु पर्छ ।\"'\n"
-    "   - A new numbered item or sub-clause\n"
-    "   - A heading or title\n"
-    "8. Within a single paragraph or clause, output all text as one continuous line "
-    "with NO line breaks.\n\n"
-    "TABLE HANDLING:\n"
-    "9. Convert tables into Markdown table format using | column | separators.\n"
-    "10. IMPORTANT: If a table appears to be a continuation from a previous page "
-    "(i.e. it starts without a header row), reproduce the column headers at the top "
-    "so each table is self-contained and understandable on its own.\n"
-    "11. Do NOT try to preserve visual spacing or ASCII-art layouts for tables.\n\n"
-    "CHART/DIAGRAM HANDLING:\n"
-    "12. For charts, graphs, or diagrams, describe them as structured Nepali text. "
-    "For example: \"चार्ट: शीर्षक '...', X-अक्ष: ..., Y-अक्ष: ..., डाटा: ...\"\n\n"
-    "TEXT HANDLING:\n"
-    "13. Preserve punctuation exactly as it appears.\n"
-    "14. Preserve numbered lists and bullet points faithfully."
+    "Precise Nepali legal OCR. Extract only visible body text from this page in Nepali "
+    "Unicode Devanagari; correct obvious OCR errors but preserve original legal wording.\n\n"
+    "Output only corrected OCR text. No intro, comments, JSON, explanations, translation, "
+    "summaries, paraphrase, modernization, invented text, repeated text, headers, footers, "
+    "page numbers, running titles, watermarks, borders, scan noise, decorative spacing, or "
+    "page separators. Keep output similar length to visible body text.\n\n"
+    "Fix obvious Devanagari OCR errors: bad characters, matras, conjuncts, garbled Unicode, "
+    "and common confusions ण↔न, ष↔स, ब↔व, भ↔म, घ↔प, छ↔इ. Preserve punctuation, legal terms, "
+    "spelling, and visible text when uncertain.\n\n"
+    "Preserve all legal numbering in Nepali Unicode exactly: १., २., ३., (१), (२), (क), "
+    "(ख). Never convert to English numerals. Preserve/reconstruct visible hierarchy: "
+    "दफा/धारा = dotted number, उपदफा/उपधारा = bracketed number, खण्ड = bracketed Nepali "
+    "letter. Start each दफा, धारा, उपदफा, उपधारा, and खण्ड on a new line; keep simple "
+    "nesting, not PDF visual spacing. Preserve body headers: भाग, अध्याय, अनुसूची, दफा, "
+    "धारा, सूची, शीर्षक, नियम, उपनियम, परिच्छेद, उपदफा, उपधारा, स्पष्टीकरण.\n\n"
+    "Reflow PDF-wrapped lines inside the same paragraph/clause into one continuous line. "
+    "Use line breaks only at real paragraph, section, clause, heading, or list-item boundaries.\n\n"
+    "Tables: always convert to Markdown using | column | separators; repeat headers for "
+    "continued tables; do not preserve ASCII/visual spacing. Charts/diagrams: describe as "
+    "structured Nepali text. Markdown is allowed only for tables."
 )
 
 # ─── Thread-safe progress counter ────────────────────────────────────────────
@@ -202,6 +190,18 @@ def ocr_single_page(pdf_path, page_index, total_pages, dpi, max_retries, tracker
     return page_num, text
 
 
+def add_text_as_docx_paragraphs(doc, text):
+    """Write hard paragraph breaks to DOCX; embedded newlines become soft breaks."""
+    previous_blank = False
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if line.strip():
+            doc.add_paragraph(line.rstrip())
+            previous_blank = False
+        elif not previous_blank:
+            doc.add_paragraph("")
+            previous_blank = True
+
+
 # ─── Single PDF Processor ────────────────────────────────────────────────────
 
 def process_single_pdf(pdf_path, args):
@@ -246,16 +246,15 @@ def process_single_pdf(pdf_path, args):
                 page_num, text = future.result()
                 results[page_num] = text
 
-        # Build .docx — continuous text, no page headings or separators
+        # Build .docx — continuous body text only, no generated headings or separators
         doc = Document()
-        doc.add_heading(pdf_path.stem, level=1)
 
         merged_text = "\n".join(
             results[pn] for pn in sorted(results.keys()) if results[pn]
         )
 
         if merged_text:
-            doc.add_paragraph(merged_text)
+            add_text_as_docx_paragraphs(doc, merged_text)
         else:
             doc.add_paragraph("[⚠ Failed to extract any text from this document]")
 
