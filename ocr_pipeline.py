@@ -191,15 +191,10 @@ def ocr_single_page(pdf_path, page_index, total_pages, dpi, max_retries, tracker
 
 
 def add_text_as_docx_paragraphs(doc, text):
-    """Write hard paragraph breaks to DOCX; embedded newlines become soft breaks."""
-    previous_blank = False
+    """Write hard paragraph breaks to DOCX; skip empty lines to ensure single line breaks."""
     for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         if line.strip():
             doc.add_paragraph(line.rstrip())
-            previous_blank = False
-        elif not previous_blank:
-            doc.add_paragraph("")
-            previous_blank = True
 
 
 # ─── Single PDF Processor ────────────────────────────────────────────────────
