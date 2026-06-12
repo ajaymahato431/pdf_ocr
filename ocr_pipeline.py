@@ -16,7 +16,7 @@ Features:
 
 Usage:
   python ocr_pipeline.py
-  python ocr_pipeline.py --dpi 400 --pages-parallel 8 --force
+  python ocr_pipeline.py --dpi 400 --pages-parallel 2 --api-parallel 2 --force
   python ocr_pipeline.py --input ./my_pdfs --output ./results
 """
 
@@ -27,6 +27,7 @@ import time
 import base64
 import argparse
 import threading
+import random
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -110,6 +111,28 @@ class ProgressTracker:
             return self._done, self._failed
 
 
+class ApiThrottle:
+    """Limit global API concurrency and pace request starts across all workers."""
+
+    def __init__(self, max_concurrent=2, min_interval=2.0):
+        self._semaphore = threading.BoundedSemaphore(max(1, max_concurrent))
+        self._min_interval = max(0.0, min_interval)
+        self._lock = threading.Lock()
+        self._next_request_at = 0.0
+
+    def acquire(self):
+        self._semaphore.acquire()
+        with self._lock:
+            now = time.monotonic()
+            if now < self._next_request_at:
+                time.sleep(self._next_request_at - now)
+                now = time.monotonic()
+            self._next_request_at = now + self._min_interval
+
+    def release(self):
+        self._semaphore.release()
+
+
 # ─── Image Preprocessing ─────────────────────────────────────────────────────
 
 def preprocess_image(png_bytes):
@@ -133,35 +156,53 @@ def preprocess_image(png_bytes):
 
 # ─── API Call ─────────────────────────────────────────────────────────────────
 
-def perform_ocr_on_page(base64_image, page_label="", max_retries=3):
+def perform_ocr_on_page(
+    base64_image,
+    page_label="",
+    max_retries=3,
+    throttle=None,
+    retry_base_delay=5.0,
+    retry_max_delay=60.0,
+):
     """Sends the page image to GPT-4o with retry + exponential backoff."""
     for attempt in range(1, max_retries + 1):
         try:
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": OCR_PROMPT},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{base64_image}",
-                                    "detail": "high"
+            if throttle:
+                throttle.acquire()
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": OCR_PROMPT},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/png;base64,{base64_image}",
+                                        "detail": "high"
+                                    }
                                 }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=4096,
-                temperature=0.0
-            )
+                            ]
+                        }
+                    ],
+                    max_tokens=4096,
+                    temperature=0.0
+                )
+            finally:
+                if throttle:
+                    throttle.release()
             return response.choices[0].message.content
         except Exception as e:
             if attempt < max_retries:
-                wait = 2 ** attempt
-                print(f"\n   ⚠ {page_label} attempt {attempt}/{max_retries} failed: {e}. Retrying in {wait}s...")
+                error_text = str(e).lower()
+                rate_limited = "rate limit" in error_text or "429" in error_text
+                wait = min(retry_max_delay, retry_base_delay * (2 ** (attempt - 1)))
+                if rate_limited:
+                    wait = min(retry_max_delay, wait * 2)
+                wait += random.uniform(0, 1.5)
+                print(f"\n   ⚠ {page_label} attempt {attempt}/{max_retries} failed: {e}. Retrying in {wait:.1f}s...")
                 time.sleep(wait)
             else:
                 print(f"\n   ✗ {page_label} FAILED after {max_retries} attempts: {e}")
@@ -170,7 +211,7 @@ def perform_ocr_on_page(base64_image, page_label="", max_retries=3):
 
 # ─── Single Page Worker ──────────────────────────────────────────────────────
 
-def ocr_single_page(pdf_path, page_index, total_pages, dpi, max_retries, tracker):
+def ocr_single_page(pdf_path, page_index, total_pages, dpi, max_retries, tracker, args):
     """Render one PDF page, preprocess it, OCR it. Fully thread-safe."""
     page_num = page_index + 1
     label = f"[p{page_num}/{total_pages}]"
@@ -184,7 +225,14 @@ def ocr_single_page(pdf_path, page_index, total_pages, dpi, max_retries, tracker
     enhanced_png = preprocess_image(raw_png)
     base64_img = base64.b64encode(enhanced_png).decode("utf-8")
 
-    text = perform_ocr_on_page(base64_img, page_label=label, max_retries=max_retries)
+    text = perform_ocr_on_page(
+        base64_img,
+        page_label=label,
+        max_retries=max_retries,
+        throttle=args.api_throttle,
+        retry_base_delay=getattr(args, "retry_base_delay", 5.0),
+        retry_max_delay=getattr(args, "retry_max_delay", 60.0),
+    )
 
     tracker.complete(success=bool(text))
     return page_num, text
@@ -208,6 +256,11 @@ def process_single_pdf(pdf_path, args):
     """
     output_folder = Path(args.output)
     docx_path = output_folder / f"{pdf_path.stem}.docx"
+    if not hasattr(args, "api_throttle"):
+        args.api_throttle = ApiThrottle(
+            getattr(args, "api_parallel", 2),
+            getattr(args, "api_min_interval", 2.0),
+        )
 
     # Skip if already processed
     if not args.force and docx_path.exists():
@@ -233,7 +286,7 @@ def process_single_pdf(pdf_path, args):
             futures = {
                 executor.submit(
                     ocr_single_page,
-                    str(pdf_path), i, total_pages, args.dpi, args.retries, tracker
+                    str(pdf_path), i, total_pages, args.dpi, args.retries, tracker, args
                 ): i
                 for i in range(total_pages)
             }
@@ -281,6 +334,7 @@ def process_pdfs(args):
     output_folder = Path(args.output)
     input_folder.mkdir(exist_ok=True)
     output_folder.mkdir(exist_ok=True)
+    args.api_throttle = ApiThrottle(args.api_parallel, args.api_min_interval)
 
     pdf_files = sorted(input_folder.glob("*.pdf"))
 
@@ -297,6 +351,8 @@ def process_pdfs(args):
     print(f"  DPI              : {args.dpi}")
     print(f"  Page concurrency : {args.pages_parallel} per PDF")
     print(f"  PDF concurrency  : {args.pdfs_parallel}")
+    print(f"  API concurrency  : {args.api_parallel} total")
+    print(f"  API start delay  : {args.api_min_interval:.1f}s minimum")
     print(f"  Retries          : {args.retries}")
     print(f"  Force re-process : {'Yes' if args.force else 'No (skips existing)'}")
     print(f"  Output folder    : {output_folder.resolve()}")
@@ -355,16 +411,20 @@ def main():
 Examples:
   python ocr_pipeline.py                           # Process all PDFs in ./data
   python ocr_pipeline.py --force                    # Re-process even if output exists
-  python ocr_pipeline.py --dpi 400 --pages-parallel 8
+  python ocr_pipeline.py --dpi 400 --pages-parallel 2 --api-parallel 2
   python ocr_pipeline.py --input ./my_pdfs --output ./results
         """
     )
     parser.add_argument("--input", default="data", help="Input folder with PDFs (default: data)")
     parser.add_argument("--output", default="output", help="Output folder for results (default: output)")
     parser.add_argument("--dpi", type=int, default=300, help="Image render DPI (default: 300)")
-    parser.add_argument("--pages-parallel", type=int, default=5, help="Concurrent pages per PDF (default: 5)")
-    parser.add_argument("--pdfs-parallel", type=int, default=3, help="Concurrent PDFs (default: 3)")
+    parser.add_argument("--pages-parallel", type=int, default=2, help="Concurrent pages per PDF (default: 2)")
+    parser.add_argument("--pdfs-parallel", type=int, default=1, help="Concurrent PDFs (default: 1)")
+    parser.add_argument("--api-parallel", type=int, default=2, help="Maximum total concurrent API calls (default: 2)")
+    parser.add_argument("--api-min-interval", type=float, default=2.0, help="Minimum seconds between API request starts (default: 2.0)")
     parser.add_argument("--retries", type=int, default=3, help="API retry attempts per page (default: 3)")
+    parser.add_argument("--retry-base-delay", type=float, default=5.0, help="Initial retry delay in seconds (default: 5.0)")
+    parser.add_argument("--retry-max-delay", type=float, default=60.0, help="Maximum retry delay in seconds (default: 60.0)")
     parser.add_argument("--force", action="store_true", help="Re-process PDFs even if output already exists")
 
     args = parser.parse_args()
