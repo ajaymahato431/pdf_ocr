@@ -16,7 +16,7 @@ Features:
 
 Usage:
   python ocr_pipeline.py
-  python ocr_pipeline.py --dpi 400 --pages-parallel 2 --api-parallel 2 --force
+  python ocr_pipeline.py --dpi 220 --api-parallel 1 --api-min-interval 5 --force
   python ocr_pipeline.py --input ./my_pdfs --output ./results
 """
 
@@ -41,6 +41,7 @@ from docx import Document
 
 load_dotenv()
 API_KEY = os.getenv("FREEMODEL_API_KEY")
+DEFAULT_REQUEST_TIMEOUT = float(os.getenv("FREEMODEL_REQUEST_TIMEOUT", "180"))
 
 if not API_KEY:
     print("❌ Error: FREEMODEL_API_KEY not found in .env file.")
@@ -48,7 +49,8 @@ if not API_KEY:
 
 client = OpenAI(
     api_key=API_KEY,
-    base_url="https://api.freemodel.dev/v1"
+    base_url="https://api.freemodel.dev/v1",
+    timeout=DEFAULT_REQUEST_TIMEOUT,
 )
 
 # ─── Prompt ───────────────────────────────────────────────────────────────────
@@ -135,14 +137,14 @@ class ApiThrottle:
 
 # ─── Image Preprocessing ─────────────────────────────────────────────────────
 
-def preprocess_image(png_bytes):
+def preprocess_image(png_bytes, image_format="jpeg", jpeg_quality=85):
     """
     Enhance a raw PDF page image for maximum OCR accuracy.
     Steps:
       1. Convert to grayscale (removes color noise, reduces payload)
       2. Boost contrast (makes text stand out from background)
       3. Sharpen (crisper character edges for Devanagari strokes)
-      4. Export as optimized PNG
+      4. Export as optimized JPEG or PNG
     """
     img = Image.open(io.BytesIO(png_bytes))
     img = img.convert("L")
@@ -150,21 +152,34 @@ def preprocess_image(png_bytes):
     img = img.filter(ImageFilter.SHARPEN)
 
     out = io.BytesIO()
-    img.save(out, format="PNG", optimize=True)
-    return out.getvalue()
+    if image_format.lower() == "png":
+        img.save(out, format="PNG", optimize=True)
+        return out.getvalue(), "image/png"
+
+    img.save(
+        out,
+        format="JPEG",
+        quality=max(1, min(95, jpeg_quality)),
+        optimize=True,
+    )
+    return out.getvalue(), "image/jpeg"
 
 
 # ─── API Call ─────────────────────────────────────────────────────────────────
 
 def perform_ocr_on_page(
     base64_image,
+    image_mime_type,
     page_label="",
     max_retries=3,
     throttle=None,
     retry_base_delay=5.0,
     retry_max_delay=60.0,
+    request_timeout=DEFAULT_REQUEST_TIMEOUT,
+    image_detail="auto",
 ):
     """Sends the page image to GPT-4o with retry + exponential backoff."""
+    payload_mb = len(base64_image) * 3 / 4 / (1024 * 1024)
     for attempt in range(1, max_retries + 1):
         try:
             if throttle:
@@ -180,15 +195,16 @@ def perform_ocr_on_page(
                                 {
                                     "type": "image_url",
                                     "image_url": {
-                                        "url": f"data:image/png;base64,{base64_image}",
-                                        "detail": "high"
+                                        "url": f"data:{image_mime_type};base64,{base64_image}",
+                                        "detail": image_detail
                                     }
                                 }
                             ]
                         }
                     ],
                     max_tokens=4096,
-                    temperature=0.0
+                    temperature=0.0,
+                    timeout=request_timeout,
                 )
             finally:
                 if throttle:
@@ -198,11 +214,15 @@ def perform_ocr_on_page(
             if attempt < max_retries:
                 error_text = str(e).lower()
                 rate_limited = "rate limit" in error_text or "429" in error_text
+                timed_out = "timed out" in error_text or "timeout" in error_text
                 wait = min(retry_max_delay, retry_base_delay * (2 ** (attempt - 1)))
-                if rate_limited:
+                if rate_limited or timed_out:
                     wait = min(retry_max_delay, wait * 2)
                 wait += random.uniform(0, 1.5)
-                print(f"\n   ⚠ {page_label} attempt {attempt}/{max_retries} failed: {e}. Retrying in {wait:.1f}s...")
+                print(
+                    f"\n   ⚠ {page_label} attempt {attempt}/{max_retries} failed: {e}. "
+                    f"Payload ~{payload_mb:.1f} MB. Retrying in {wait:.1f}s..."
+                )
                 time.sleep(wait)
             else:
                 print(f"\n   ✗ {page_label} FAILED after {max_retries} attempts: {e}")
@@ -222,16 +242,23 @@ def ocr_single_page(pdf_path, page_index, total_pages, dpi, max_retries, tracker
     raw_png = pix.tobytes("png")
     pdf_doc.close()
 
-    enhanced_png = preprocess_image(raw_png)
-    base64_img = base64.b64encode(enhanced_png).decode("utf-8")
+    enhanced_image, image_mime_type = preprocess_image(
+        raw_png,
+        image_format=getattr(args, "image_format", "jpeg"),
+        jpeg_quality=getattr(args, "jpeg_quality", 85),
+    )
+    base64_img = base64.b64encode(enhanced_image).decode("utf-8")
 
     text = perform_ocr_on_page(
         base64_img,
+        image_mime_type,
         page_label=label,
         max_retries=max_retries,
         throttle=args.api_throttle,
         retry_base_delay=getattr(args, "retry_base_delay", 5.0),
         retry_max_delay=getattr(args, "retry_max_delay", 60.0),
+        request_timeout=getattr(args, "request_timeout", DEFAULT_REQUEST_TIMEOUT),
+        image_detail=getattr(args, "image_detail", "auto"),
     )
 
     tracker.complete(success=bool(text))
@@ -353,6 +380,11 @@ def process_pdfs(args):
     print(f"  PDF concurrency  : {args.pdfs_parallel}")
     print(f"  API concurrency  : {args.api_parallel} total")
     print(f"  API start delay  : {args.api_min_interval:.1f}s minimum")
+    print(f"  Request timeout  : {args.request_timeout:.0f}s")
+    print(f"  Image format     : {args.image_format.upper()}")
+    if args.image_format == "jpeg":
+        print(f"  JPEG quality     : {args.jpeg_quality}")
+    print(f"  Image detail     : {args.image_detail}")
     print(f"  Retries          : {args.retries}")
     print(f"  Force re-process : {'Yes' if args.force else 'No (skips existing)'}")
     print(f"  Output folder    : {output_folder.resolve()}")
@@ -411,17 +443,21 @@ def main():
 Examples:
   python ocr_pipeline.py                           # Process all PDFs in ./data
   python ocr_pipeline.py --force                    # Re-process even if output exists
-  python ocr_pipeline.py --dpi 400 --pages-parallel 2 --api-parallel 2
+  python ocr_pipeline.py --dpi 220 --api-parallel 1 --api-min-interval 5
   python ocr_pipeline.py --input ./my_pdfs --output ./results
         """
     )
     parser.add_argument("--input", default="data", help="Input folder with PDFs (default: data)")
     parser.add_argument("--output", default="output", help="Output folder for results (default: output)")
-    parser.add_argument("--dpi", type=int, default=300, help="Image render DPI (default: 300)")
+    parser.add_argument("--dpi", type=int, default=220, help="Image render DPI (default: 220)")
     parser.add_argument("--pages-parallel", type=int, default=2, help="Concurrent pages per PDF (default: 2)")
     parser.add_argument("--pdfs-parallel", type=int, default=1, help="Concurrent PDFs (default: 1)")
-    parser.add_argument("--api-parallel", type=int, default=2, help="Maximum total concurrent API calls (default: 2)")
-    parser.add_argument("--api-min-interval", type=float, default=2.0, help="Minimum seconds between API request starts (default: 2.0)")
+    parser.add_argument("--api-parallel", type=int, default=1, help="Maximum total concurrent API calls (default: 1)")
+    parser.add_argument("--api-min-interval", type=float, default=5.0, help="Minimum seconds between API request starts (default: 5.0)")
+    parser.add_argument("--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT, help="API request timeout in seconds (default: 180 or FREEMODEL_REQUEST_TIMEOUT)")
+    parser.add_argument("--image-format", choices=["jpeg", "png"], default="jpeg", help="Encoded page image format sent to the API (default: jpeg)")
+    parser.add_argument("--jpeg-quality", type=int, default=85, help="JPEG quality when --image-format jpeg is used (default: 85)")
+    parser.add_argument("--image-detail", choices=["auto", "low", "high"], default="auto", help="Vision detail hint sent to the API (default: auto)")
     parser.add_argument("--retries", type=int, default=3, help="API retry attempts per page (default: 3)")
     parser.add_argument("--retry-base-delay", type=float, default=5.0, help="Initial retry delay in seconds (default: 5.0)")
     parser.add_argument("--retry-max-delay", type=float, default=60.0, help="Maximum retry delay in seconds (default: 60.0)")
