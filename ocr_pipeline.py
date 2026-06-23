@@ -137,7 +137,7 @@ class ApiThrottle:
 
 # ─── Image Preprocessing ─────────────────────────────────────────────────────
 
-def preprocess_image(png_bytes, image_format="jpeg", jpeg_quality=85):
+def preprocess_image(png_bytes, image_format="jpeg", jpeg_quality=90):
     """
     Enhance a raw PDF page image for maximum OCR accuracy.
     Steps:
@@ -245,7 +245,7 @@ def ocr_single_page(pdf_path, page_index, total_pages, dpi, max_retries, tracker
     enhanced_image, image_mime_type = preprocess_image(
         raw_png,
         image_format=getattr(args, "image_format", "jpeg"),
-        jpeg_quality=getattr(args, "jpeg_quality", 85),
+        jpeg_quality=getattr(args, "jpeg_quality", 90),
     )
     base64_img = base64.b64encode(enhanced_image).decode("utf-8")
 
@@ -449,14 +449,14 @@ Examples:
     )
     parser.add_argument("--input", default="data", help="Input folder with PDFs (default: data)")
     parser.add_argument("--output", default="output", help="Output folder for results (default: output)")
-    parser.add_argument("--dpi", type=int, default=220, help="Image render DPI (default: 220)")
+    parser.add_argument("--dpi", type=int, default=240, help="Image render DPI (default: 240)")
     parser.add_argument("--pages-parallel", type=int, default=2, help="Concurrent pages per PDF (default: 2)")
     parser.add_argument("--pdfs-parallel", type=int, default=1, help="Concurrent PDFs (default: 1)")
     parser.add_argument("--api-parallel", type=int, default=1, help="Maximum total concurrent API calls (default: 1)")
     parser.add_argument("--api-min-interval", type=float, default=5.0, help="Minimum seconds between API request starts (default: 5.0)")
     parser.add_argument("--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT, help="API request timeout in seconds (default: 180 or FREEMODEL_REQUEST_TIMEOUT)")
     parser.add_argument("--image-format", choices=["jpeg", "png"], default="jpeg", help="Encoded page image format sent to the API (default: jpeg)")
-    parser.add_argument("--jpeg-quality", type=int, default=85, help="JPEG quality when --image-format jpeg is used (default: 85)")
+    parser.add_argument("--jpeg-quality", type=int, default=90, help="JPEG quality when --image-format jpeg is used (default: 90)")
     parser.add_argument("--image-detail", choices=["auto", "low", "high"], default="auto", help="Vision detail hint sent to the API (default: auto)")
     parser.add_argument("--retries", type=int, default=3, help="API retry attempts per page (default: 3)")
     parser.add_argument("--retry-base-delay", type=float, default=5.0, help="Initial retry delay in seconds (default: 5.0)")
