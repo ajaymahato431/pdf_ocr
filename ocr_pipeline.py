@@ -1,22 +1,24 @@
 """
 Nepali Devanagari OCR Pipeline
 ==============================
-High-accuracy, high-throughput PDF → DOCX converter using GPT-4o vision.
-Optimized for RAG ingestion into ChromaDB.
+High-accuracy, high-throughput PDF → DOCX converter using OpenAI-compatible vision models (GPT-4o).
+Optimized for RAG ingestion into vector stores (e.g. ChromaDB).
 
 Features:
   - Image preprocessing (grayscale, contrast, sharpening) for maximum accuracy
   - Concurrent page-level and PDF-level parallelism
-  - Automatic retry with exponential backoff
+  - Global API throttling and paced start intervals
+  - Automatic retry with exponential backoff and jitter
   - Resume support: skips already-processed PDFs (use --force to re-process)
-  - RAG-optimized output: continuous text, markdown tables, no page separators
+  - RAG-optimized output: continuous text, markdown tables, no synthetic page separators
   - Multi-page table header preservation
-  - Progress bars and detailed summary report
-  - CLI arguments for all key settings
+  - Progress bars and detailed summary execution report
+  - Flexible provider support: OpenAI, FreeModel, OpenRouter, and self-hosted endpoints
+  - Full configuration precedence: CLI Flags > .env / Environment Variables > Defaults
 
 Usage:
   python ocr_pipeline.py
-  python ocr_pipeline.py --dpi 220 --api-parallel 1 --api-min-interval 5 --force
+  python ocr_pipeline.py --dpi 240 --api-parallel 2 --api-min-interval 2.0
   python ocr_pipeline.py --input ./my_pdfs --output ./results
 """
 
@@ -37,23 +39,11 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageEnhance, ImageFilter
 from docx import Document
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ─── Environment Loading ──────────────────────────────────────────────────────
 
 load_dotenv()
-API_KEY = os.getenv("FREEMODEL_API_KEY")
-DEFAULT_REQUEST_TIMEOUT = float(os.getenv("FREEMODEL_REQUEST_TIMEOUT", "180"))
 
-if not API_KEY:
-    print("❌ Error: FREEMODEL_API_KEY not found in .env file.")
-    sys.exit(1)
-
-client = OpenAI(
-    api_key=API_KEY,
-    base_url="https://api.freemodel.dev/v1",
-    timeout=DEFAULT_REQUEST_TIMEOUT,
-)
-
-# ─── Prompt ───────────────────────────────────────────────────────────────────
+# ─── OCR System Prompt ────────────────────────────────────────────────────────
 
 OCR_PROMPT = (
     "Precise Nepali legal OCR. Extract only visible body text from this page in Nepali "
@@ -78,7 +68,7 @@ OCR_PROMPT = (
     "structured Nepali text. Markdown is allowed only for tables."
 )
 
-# ─── Thread-safe progress counter ────────────────────────────────────────────
+# ─── Thread-safe Progress Counter ────────────────────────────────────────────
 
 class ProgressTracker:
     """Thread-safe progress tracker with live percentage display."""
@@ -95,9 +85,9 @@ class ProgressTracker:
             self._done += 1
             if not success:
                 self._failed += 1
-            pct = (self._done / self._total) * 100
+            pct = (self._done / self._total) * 100 if self._total > 0 else 100
             bar_len = 30
-            filled = int(bar_len * self._done / self._total)
+            filled = int(bar_len * self._done / self._total) if self._total > 0 else bar_len
             bar = "█" * filled + "░" * (bar_len - filled)
             sys.stdout.write(
                 f"\r   {self._label}: {bar} {self._done}/{self._total} ({pct:.0f}%)"
@@ -116,7 +106,7 @@ class ProgressTracker:
 class ApiThrottle:
     """Limit global API concurrency and pace request starts across all workers."""
 
-    def __init__(self, max_concurrent=2, min_interval=2.0):
+    def __init__(self, max_concurrent=1, min_interval=5.0):
         self._semaphore = threading.BoundedSemaphore(max(1, max_concurrent))
         self._min_interval = max(0.0, min_interval)
         self._lock = threading.Lock()
@@ -168,6 +158,8 @@ def preprocess_image(png_bytes, image_format="jpeg", jpeg_quality=90):
 # ─── API Call ─────────────────────────────────────────────────────────────────
 
 def perform_ocr_on_page(
+    client,
+    model,
     base64_image,
     image_mime_type,
     page_label="",
@@ -175,10 +167,10 @@ def perform_ocr_on_page(
     throttle=None,
     retry_base_delay=5.0,
     retry_max_delay=60.0,
-    request_timeout=DEFAULT_REQUEST_TIMEOUT,
+    request_timeout=180.0,
     image_detail="auto",
 ):
-    """Sends the page image to GPT-4o with retry + exponential backoff."""
+    """Sends the page image to the vision model with retry + exponential backoff."""
     payload_mb = len(base64_image) * 3 / 4 / (1024 * 1024)
     for attempt in range(1, max_retries + 1):
         try:
@@ -186,7 +178,7 @@ def perform_ocr_on_page(
                 throttle.acquire()
             try:
                 response = client.chat.completions.create(
-                    model="gpt-4o",
+                    model=model,
                     messages=[
                         {
                             "role": "user",
@@ -196,10 +188,10 @@ def perform_ocr_on_page(
                                     "type": "image_url",
                                     "image_url": {
                                         "url": f"data:{image_mime_type};base64,{base64_image}",
-                                        "detail": image_detail
-                                    }
-                                }
-                            ]
+                                        "detail": image_detail,
+                                    },
+                                },
+                            ],
                         }
                     ],
                     max_tokens=4096,
@@ -232,7 +224,7 @@ def perform_ocr_on_page(
 # ─── Single Page Worker ──────────────────────────────────────────────────────
 
 def ocr_single_page(pdf_path, page_index, total_pages, dpi, max_retries, tracker, args):
-    """Render one PDF page, preprocess it, OCR it. Fully thread-safe."""
+    """Render one PDF page, preprocess it, and run OCR. Fully thread-safe."""
     page_num = page_index + 1
     label = f"[p{page_num}/{total_pages}]"
 
@@ -250,14 +242,16 @@ def ocr_single_page(pdf_path, page_index, total_pages, dpi, max_retries, tracker
     base64_img = base64.b64encode(enhanced_image).decode("utf-8")
 
     text = perform_ocr_on_page(
-        base64_img,
-        image_mime_type,
+        client=args.client,
+        model=args.model,
+        base64_image=base64_img,
+        image_mime_type=image_mime_type,
         page_label=label,
         max_retries=max_retries,
         throttle=args.api_throttle,
         retry_base_delay=getattr(args, "retry_base_delay", 5.0),
         retry_max_delay=getattr(args, "retry_max_delay", 60.0),
-        request_timeout=getattr(args, "request_timeout", DEFAULT_REQUEST_TIMEOUT),
+        request_timeout=getattr(args, "request_timeout", 180.0),
         image_detail=getattr(args, "image_detail", "auto"),
     )
 
@@ -285,8 +279,8 @@ def process_single_pdf(pdf_path, args):
     docx_path = output_folder / f"{pdf_path.stem}.docx"
     if not hasattr(args, "api_throttle"):
         args.api_throttle = ApiThrottle(
-            getattr(args, "api_parallel", 2),
-            getattr(args, "api_min_interval", 2.0),
+            getattr(args, "api_parallel", 1),
+            getattr(args, "api_min_interval", 5.0),
         )
 
     # Skip if already processed
@@ -344,23 +338,61 @@ def process_single_pdf(pdf_path, args):
             "status": "success",
             "pages": total_pages,
             "failed": failed,
-            "time": elapsed
+            "time": elapsed,
         }
 
     except Exception as e:
         elapsed = time.time() - start
         print(f"   ❌ FAILED: {e}")
-        return {"file": pdf_path.name, "status": "error", "pages": 0, "failed": 0, "time": elapsed, "error": str(e)}
+        return {
+            "file": pdf_path.name,
+            "status": "error",
+            "pages": 0,
+            "failed": 0,
+            "time": elapsed,
+            "error": str(e),
+        }
 
 
 # ─── Main Orchestrator ───────────────────────────────────────────────────────
 
 def process_pdfs(args):
     """Find all PDFs and process them with maximum throughput."""
+    # Resolve API Key
+    api_key = (
+        args.api_key
+        or os.getenv("OPENAI_API_KEY")
+        or os.getenv("FREEMODEL_API_KEY")
+    )
+
+    if not api_key:
+        print("\n❌ Error: No API key found.")
+        print("Please configure your credentials using one of the following methods:")
+        print("  1. Create a .env file with OPENAI_API_KEY or FREEMODEL_API_KEY (see .env.example)")
+        print("  2. Export the environment variable: export OPENAI_API_KEY=\"your_key\"")
+        print("  3. Pass the key via CLI: python ocr_pipeline.py --api-key \"your_key\"\n")
+        sys.exit(1)
+
+    # Resolve Base URL
+    base_url = (
+        args.base_url
+        or os.getenv("OPENAI_BASE_URL")
+        or os.getenv("FREEMODEL_BASE_URL")
+        or "https://api.freemodel.dev/v1"
+    )
+
+    # Initialize OpenAI client
+    args.client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=args.request_timeout,
+    )
+
     input_folder = Path(args.input)
     output_folder = Path(args.output)
-    input_folder.mkdir(exist_ok=True)
-    output_folder.mkdir(exist_ok=True)
+    input_folder.mkdir(parents=True, exist_ok=True)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
     args.api_throttle = ApiThrottle(args.api_parallel, args.api_min_interval)
 
     pdf_files = sorted(input_folder.glob("*.pdf"))
@@ -374,7 +406,9 @@ def process_pdfs(args):
     print("╔════════════════════════════════════════════════════════════╗")
     print("║          Nepali Devanagari OCR Pipeline                   ║")
     print("╚════════════════════════════════════════════════════════════╝")
-    print(f"  PDFs found      : {len(pdf_files)}")
+    print(f"  PDFs found       : {len(pdf_files)}")
+    print(f"  Model            : {args.model}")
+    print(f"  Base URL         : {base_url}")
     print(f"  DPI              : {args.dpi}")
     print(f"  Page concurrency : {args.pages_parallel} per PDF")
     print(f"  PDF concurrency  : {args.pdfs_parallel}")
@@ -387,6 +421,7 @@ def process_pdfs(args):
     print(f"  Image detail     : {args.image_detail}")
     print(f"  Retries          : {args.retries}")
     print(f"  Force re-process : {'Yes' if args.force else 'No (skips existing)'}")
+    print(f"  Input folder     : {input_folder.resolve()}")
     print(f"  Output folder    : {output_folder.resolve()}")
 
     # Process PDFs
@@ -433,36 +468,143 @@ def process_pdfs(args):
         print(f"\n💡 {len(skipped)} file(s) skipped (already processed). Use --force to re-process.")
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
+# ─── CLI Argument Parser ─────────────────────────────────────────────────────
 
-def main():
+def build_parser():
+    """Build command-line parser with full environment variable fallback support."""
     parser = argparse.ArgumentParser(
-        description="Nepali Devanagari OCR Pipeline — PDF to DOCX using GPT-4o vision (RAG-optimized)",
+        description="Nepali Devanagari OCR Pipeline — PDF to DOCX using Vision LLMs (RAG-optimized)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python ocr_pipeline.py                           # Process all PDFs in ./data
-  python ocr_pipeline.py --force                    # Re-process even if output exists
-  python ocr_pipeline.py --dpi 220 --api-parallel 1 --api-min-interval 5
-  python ocr_pipeline.py --input ./my_pdfs --output ./results
-        """
+  python ocr_pipeline.py                                         # Process all PDFs in ./data
+  python ocr_pipeline.py --force                                 # Re-process even if output exists
+  python ocr_pipeline.py --dpi 240 --api-parallel 2              # Adjust rendering quality & concurrency
+  python ocr_pipeline.py --input ./my_pdfs --output ./results    # Custom directories
+  python ocr_pipeline.py --model gpt-4o-mini                     # Choose alternative vision model
+  python ocr_pipeline.py --base-url https://api.openai.com/v1     # Direct OpenAI endpoint
+        """,
     )
-    parser.add_argument("--input", default="data", help="Input folder with PDFs (default: data)")
-    parser.add_argument("--output", default="output", help="Output folder for results (default: output)")
-    parser.add_argument("--dpi", type=int, default=240, help="Image render DPI (default: 240)")
-    parser.add_argument("--pages-parallel", type=int, default=2, help="Concurrent pages per PDF (default: 2)")
-    parser.add_argument("--pdfs-parallel", type=int, default=1, help="Concurrent PDFs (default: 1)")
-    parser.add_argument("--api-parallel", type=int, default=1, help="Maximum total concurrent API calls (default: 1)")
-    parser.add_argument("--api-min-interval", type=float, default=5.0, help="Minimum seconds between API request starts (default: 5.0)")
-    parser.add_argument("--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT, help="API request timeout in seconds (default: 180 or FREEMODEL_REQUEST_TIMEOUT)")
-    parser.add_argument("--image-format", choices=["jpeg", "png"], default="jpeg", help="Encoded page image format sent to the API (default: jpeg)")
-    parser.add_argument("--jpeg-quality", type=int, default=90, help="JPEG quality when --image-format jpeg is used (default: 90)")
-    parser.add_argument("--image-detail", choices=["auto", "low", "high"], default="auto", help="Vision detail hint sent to the API (default: auto)")
-    parser.add_argument("--retries", type=int, default=3, help="API retry attempts per page (default: 3)")
-    parser.add_argument("--retry-base-delay", type=float, default=5.0, help="Initial retry delay in seconds (default: 5.0)")
-    parser.add_argument("--retry-max-delay", type=float, default=60.0, help="Maximum retry delay in seconds (default: 60.0)")
-    parser.add_argument("--force", action="store_true", help="Re-process PDFs even if output already exists")
 
+    # API & Provider Options
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="OpenAI-compatible API key (default: from OPENAI_API_KEY or FREEMODEL_API_KEY)",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="API Base URL (default: OPENAI_BASE_URL, FREEMODEL_BASE_URL, or https://api.freemodel.dev/v1)",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.getenv("OCR_MODEL", "gpt-4o"),
+        help="Vision model name (default: OCR_MODEL or gpt-4o)",
+    )
+
+    # Directories
+    parser.add_argument(
+        "--input",
+        default=os.getenv("OCR_INPUT_DIR", "data"),
+        help="Input folder with PDFs (default: OCR_INPUT_DIR or 'data')",
+    )
+    parser.add_argument(
+        "--output",
+        default=os.getenv("OCR_OUTPUT_DIR", "output"),
+        help="Output folder for DOCX results (default: OCR_OUTPUT_DIR or 'output')",
+    )
+
+    # Rendering & Optimization
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        default=int(os.getenv("OCR_DPI", "240")),
+        help="Image render DPI (default: OCR_DPI or 240)",
+    )
+    parser.add_argument(
+        "--image-format",
+        choices=["jpeg", "png"],
+        default=os.getenv("OCR_IMAGE_FORMAT", "jpeg"),
+        help="Encoded page image format sent to the API (default: OCR_IMAGE_FORMAT or 'jpeg')",
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=int(os.getenv("OCR_JPEG_QUALITY", "90")),
+        help="JPEG quality when --image-format jpeg is used (default: OCR_JPEG_QUALITY or 90)",
+    )
+    parser.add_argument(
+        "--image-detail",
+        choices=["auto", "low", "high"],
+        default=os.getenv("OCR_IMAGE_DETAIL", "auto"),
+        help="Vision detail hint sent to the API (default: OCR_IMAGE_DETAIL or 'auto')",
+    )
+
+    # Concurrency & Rate Limiting
+    parser.add_argument(
+        "--pages-parallel",
+        type=int,
+        default=int(os.getenv("OCR_PAGES_PARALLEL", "2")),
+        help="Concurrent pages per PDF (default: OCR_PAGES_PARALLEL or 2)",
+    )
+    parser.add_argument(
+        "--pdfs-parallel",
+        type=int,
+        default=int(os.getenv("OCR_PDFS_PARALLEL", "1")),
+        help="Concurrent PDFs processed in parallel (default: OCR_PDFS_PARALLEL or 1)",
+    )
+    parser.add_argument(
+        "--api-parallel",
+        type=int,
+        default=int(os.getenv("OCR_API_PARALLEL", "1")),
+        help="Maximum total concurrent API calls (default: OCR_API_PARALLEL or 1)",
+    )
+    parser.add_argument(
+        "--api-min-interval",
+        type=float,
+        default=float(os.getenv("OCR_API_MIN_INTERVAL", "5.0")),
+        help="Minimum seconds between API request starts (default: OCR_API_MIN_INTERVAL or 5.0)",
+    )
+
+    # Timeouts & Retries
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=float(os.getenv("OCR_REQUEST_TIMEOUT", os.getenv("FREEMODEL_REQUEST_TIMEOUT", "180"))),
+        help="API request timeout in seconds (default: OCR_REQUEST_TIMEOUT or 180)",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=int(os.getenv("OCR_RETRIES", "3")),
+        help="API retry attempts per page (default: OCR_RETRIES or 3)",
+    )
+    parser.add_argument(
+        "--retry-base-delay",
+        type=float,
+        default=float(os.getenv("OCR_RETRY_BASE_DELAY", "5.0")),
+        help="Initial retry delay in seconds (default: OCR_RETRY_BASE_DELAY or 5.0)",
+    )
+    parser.add_argument(
+        "--retry-max-delay",
+        type=float,
+        default=float(os.getenv("OCR_RETRY_MAX_DELAY", "60.0")),
+        help="Maximum retry delay in seconds (default: OCR_RETRY_MAX_DELAY or 60.0)",
+    )
+
+    # Flags
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-process PDFs even if output already exists",
+    )
+
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     process_pdfs(args)
 

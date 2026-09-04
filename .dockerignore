@@ -1,0 +1,52 @@
+# Version control & Git
+.git/
+.github/
+.gitignore
+.dockerignore
+
+# Environment files & secrets
+.env
+.env.*
+.env.local
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local data & generated documents
+data/
+output/
+results/
+temp/
+tmp/
+*.pdf
+*.docx
+*.png
+*.jpg
+*.jpeg
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Build & packaging
+build/
+dist/
+*.egg-info/
+
+# Documentation and notes (not needed inside container runtime)
+*.md
+LICENSE

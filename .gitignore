@@ -1,5 +1,62 @@
+# Environment variables & local secrets
 .env
-/data
-/output
-/.venv
-/__pycache__
+.env.*
+.env.local
+!.env.example
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Bytecode & Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Build & packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+*.spec
+
+# Testing & linting caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local input/output directories and data artifacts
+data/
+output/
+results/
+temp/
+tmp/
+*.pdf
+*.docx
+*.png
+*.jpg
+*.jpeg
+
+# Operating System & IDE artifacts
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+*.bak
+
+# Logs
+*.log
+error_logs.txt
+skipped_culprits.txt
